@@ -54,6 +54,8 @@
 #include "vos_types.h"
 #include "vos_trace.h"
 #include "vos_sched.h"
+#include <linux/uaccess.h> /* copy_from_user, access_ok */
+#include <linux/slab.h>    /* kmalloc, kfree */
 
 //Ms to Micro Sec
 #define MS_TO_MUS(x)   ((x)*1000);
@@ -1690,67 +1692,116 @@ int wlan_hdd_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
                      struct cfg80211_mgmt_tx_params *params, u64 *cookie)
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0))
 int wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct wireless_dev *wdev,
-                     struct ieee80211_channel *chan, bool offchan,
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0))
-                     enum nl80211_channel_type channel_type,
-                     bool channel_type_valid,
-#endif
-                     unsigned int wait,
-                     const u8 *buf, size_t len,  bool no_cck,
-                     bool dont_wait_for_ack, u64 *cookie )
+                      struct ieee80211_channel *chan, bool offchan,
+                      #if (LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0))
+                      enum nl80211_channel_type channel_type,
+                      bool channel_type_valid,
+                      #endif
+                      unsigned int wait,
+                      const u8 *buf, size_t len,  bool no_cck,
+                      bool dont_wait_for_ack, u64 *cookie )
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0))
 int wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
-                     struct ieee80211_channel *chan, bool offchan,
-                     enum nl80211_channel_type channel_type,
-                     bool channel_type_valid, unsigned int wait,
-                     const u8 *buf, size_t len,  bool no_cck,
-                     bool dont_wait_for_ack, u64 *cookie )
+                      struct ieee80211_channel *chan, bool offchan,
+                      enum nl80211_channel_type channel_type,
+                      bool channel_type_valid, unsigned int wait,
+                      const u8 *buf, size_t len,  bool no_cck,
+                      bool dont_wait_for_ack, u64 *cookie )
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
 int wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
-                     struct ieee80211_channel *chan, bool offchan,
-                     enum nl80211_channel_type channel_type,
-                     bool channel_type_valid, unsigned int wait,
-                     const u8 *buf, size_t len, u64 *cookie )
+                      struct ieee80211_channel *chan, bool offchan,
+                      enum nl80211_channel_type channel_type,
+                      bool channel_type_valid, unsigned int wait,
+                      const u8 *buf, size_t len, u64 *cookie )
 #else
 int wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
-                     struct ieee80211_channel *chan,
-                     enum nl80211_channel_type channel_type,
-                     bool channel_type_valid,
-                     const u8 *buf, size_t len, u64 *cookie )
+                      struct ieee80211_channel *chan,
+                      enum nl80211_channel_type channel_type,
+                      bool channel_type_valid,
+                      const u8 *buf, size_t len, u64 *cookie )
 #endif //LINUX_VERSION_CODE
 {
     int ret;
+    const u8 *ubuf = NULL;
+    size_t ulen = 0;
+    const u8 *kbuf = NULL;
+    u8 *tmp_buf = NULL;
 
     vos_ssr_protect(__func__);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+
+    #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+    ubuf = params->buf;
+    ulen = params->len;
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0))
+    ubuf = buf;
+    ulen = len;
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0))
+    ubuf = buf;
+    ulen = len;
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
+    ubuf = buf;
+    ulen = len;
+    #else
+    ubuf = buf;
+    ulen = len;
+    #endif
+
+    /*
+     * If ubuf is a userspace pointer, access_ok() will return true.
+     * In that case copy it into kernel memory before passing it down to
+     * __wlan_hdd_mgmt_tx to avoid dereferencing user pointers in kernel.
+     * If ubuf is already kernel memory, access_ok() will generally be false
+     * and we use the pointer directly (no double copy).
+     */
+    if (ubuf && ulen > 0 && access_ok(VERIFY_READ, (const void __user *)ubuf, ulen)) {
+        tmp_buf = kmalloc(ulen, GFP_KERNEL);
+        if (!tmp_buf) {
+            vos_ssr_unprotect(__func__);
+            return -ENOMEM;
+        }
+        if (copy_from_user(tmp_buf, ubuf, ulen)) {
+            kfree(tmp_buf);
+            vos_ssr_unprotect(__func__);
+            return -EFAULT;
+        }
+        kbuf = tmp_buf;
+    } else {
+        kbuf = ubuf;
+    }
+
+    #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
     ret =  __wlan_hdd_mgmt_tx(wiphy, wdev, params->chan, params->offchan,
-                              params->wait, params->buf, params->len,
+                              params->wait, kbuf, ulen,
                               params->no_cck, params->dont_wait_for_ack,
                               cookie);
-#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0))
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0))
     ret =  __wlan_hdd_mgmt_tx(wiphy, wdev,
                               chan, offchan,
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0))
+                              #if (LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0))
                               channel_type,
                               channel_type_valid,
-#endif
+                              #endif
                               wait,
-                              buf, len, no_cck,
+                              kbuf, ulen, no_cck,
                               dont_wait_for_ack, cookie);
-#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0))
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0))
     ret = __wlan_hdd_mgmt_tx(wiphy, dev, chan, offchan,
                              channel_type, channel_type_valid, wait,
-                             buf, len,  no_cck,
+                             kbuf, ulen,  no_cck,
                              dont_wait_for_ack, cookie);
-#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
+    #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
     ret = __wlan_hdd_mgmt_tx(wiphy, dev, chan, offchan,
-                     channel_type, channel_type_valid, wait,
-                     buf, len, cookie);
-#else
+                             channel_type, channel_type_valid, wait,
+                             kbuf, ulen, cookie);
+    #else
     ret = __wlan_hdd_mgmt_tx(wiphy, dev, chan, channel_type,
-                             channel_type_valid, buf, len, cookie);
-#endif //LINUX_VERSION_CODE
+                             channel_type_valid, kbuf, ulen, cookie);
+    #endif //LINUX_VERSION_CODE
+
     vos_ssr_unprotect(__func__);
+
+    if (tmp_buf)
+        kfree(tmp_buf);
 
     return ret;
 }
